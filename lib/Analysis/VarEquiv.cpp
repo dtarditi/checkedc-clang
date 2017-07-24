@@ -392,3 +392,96 @@ void Partition::dump(raw_ostream &OS) const {
 }
 } // namespace PartitionRefinement
 } // namespace Clang
+
+namespace {
+class AddressTakenAnalysis: public StmtVisitor<AddressTakenAnalysis> {
+private:
+  SmallVector<VarDecl *, 8> Vars;
+
+  AddressTakenAnalysis() {}
+
+public:
+  void VisitUnaryAddrOf(const UnaryOperator *E) {
+    Expr *Operand = E->getSubExpr();
+    DeclRefExpr *DR = dyn_cast<DeclRefExpr>(Operand);
+    if (DR) {
+      VarDecl *VD = dyn_cast<VarDecl>(DR->getDecl());
+      if (VD)
+        Vars.push_back(VD);
+      return;
+    }
+  }
+
+  void analyze(Stmt *Body) {
+    Visit(Body);
+    std::sort(Vars.begin(), Vars.end());
+    std::unique(Vars.begin(), Vars.end());
+  }
+
+  bool isAddressTaken(VarDecl *VD) {
+    return std::binary_search(Vars.begin(), Vars.end(), VD);
+  }
+};
+}
+
+namespace {
+class FindInterestingVars : public StmtVisitor<FindInterestingVars> {
+private:
+  SmallVector<VarDecl *, 8> Vars;
+  AddressTakenAnalysis &AddressTaken;
+
+public:
+
+  FindInterestingVars(AddressTakenAnalysis &ATA) :AddressTaken(ATA) {
+  }
+
+  void VisitBinaryOperator(const BinaryOperator *BO) {
+  }
+
+  void VisitUnaryAddrOf(const UnaryOperator *E) {
+    Expr *Operand = E->getSubExpr();
+    DeclRefExpr *DR = dyn_cast<DeclRefExpr>(Operand);
+    if (DR) {
+      VarDecl *VD = dyn_cast<VarDecl>(DR->getDecl());
+      if (VD)
+        Vars.push_back(VD);
+      return;
+    }
+  }
+
+  void analyze(Stmt *Body) {
+    Visit(Body);
+    std::sort(Vars.begin(), Vars.end());
+    std::unique(Vars.begin(), Vars.end());
+  }
+
+  bool isAddressTaken(VarDecl *VD) {
+    return std::binary_search(Vars.begin(), Vars.end(), VD);
+  }
+};
+}
+
+
+VarEquiv::VarEquiv(CFG *cfg /*, Stmt Body */) : cfg(cfg) {
+}
+
+void VarEquiv::analyze() {
+   // Step 1: compute the set of address-taken variables, because we'll exclude those for now.
+   // Step 2: find the set of interesting variables and number them.
+}
+
+void VarEquiv::setCurrentBlock(CFGBlock block) {
+}
+
+void VarEquiv::moveAfterNextStmt() {
+}
+
+void VarEquiv::dumpAll(const SourceManager& M) {
+}
+
+void VarEquiv::dumpCurrentStmt(const SourceManager& M) {
+}
+
+const VarDecl *VarEquiv::getRepresentative(const VarDecl *V) {
+  return nullptr;
+}
