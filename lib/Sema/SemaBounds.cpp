@@ -1151,8 +1151,15 @@ namespace {
       DumpBounds(S.getLangOpts().DumpInferredBounds), FunctionBody(Body) {
 
       if (Body) {
-        Cfg = CFG::buildCFG(FD, Body, &S.getASTContext(), CFG::BuildOptions());
-        EquivalenceRelation = new VarEquiv(Cfg.get());
+		Cfg = nullptr;
+		EquivalenceRelation = nullptr;
+/*
+		CFG::BuildOptions Options;
+		Options.AddInitializers = true;
+        Cfg = CFG::buildCFG(FD, Body, &S.getASTContext(), Options);
+		Cfg->print(llvm::outs(), S.getLangOpts(), false);
+        EquivalenceRelation = new VarEquiv(Cfg.get(), Body);
+*/
       }
       else {
         Cfg = nullptr;

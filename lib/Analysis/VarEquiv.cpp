@@ -14,7 +14,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Analysis/Analyses/VarEquiv.h"
-#include "clang/Analysis/CFG.h"
 #include "clang/AST/StmtVisitor.h"
 
 using namespace clang;
@@ -106,6 +105,7 @@ public:
     Target.assign(Sets.begin(), Sets.end());
   }
 
+ 
   Set *get(unsigned i) const {
     if (i < Sets.size())
       return Sets[i];
@@ -247,6 +247,26 @@ void Partition::add(Element Member, Element Elem) {
     Node = add(S , Member);
   }
   add(Node->ContainingSet, Elem);
+}
+
+// Make the current partition be the same partition as P.  Do this
+// by making a semantic copy. We don't attempt to make a deep copy of the
+// P because that would be quite complicated to do.
+void Partition::assign(Partition &P) {
+  clear();
+  unsigned count = P.Sets->size();
+  for (unsigned i = 0; i < count; i++) {
+    Set *S = P.Sets->get(i);
+    ListNode *Start = S->Head;
+    ListNode *Current = S->Head->Next;
+    while (Current != nullptr)
+      add(Start->Elem, Current->Elem);
+  }
+}
+
+void Partition::clear() {
+  Partition Empty;
+  refine(&Empty);
 }
 
 bool Partition::isSingleton(Element Elem) const {
@@ -391,16 +411,15 @@ void Partition::dump(raw_ostream &OS) const {
   }
 }
 } // namespace PartitionRefinement
-} // namespace Clang
 
 namespace {
 class AddressTakenAnalysis: public StmtVisitor<AddressTakenAnalysis> {
 private:
   SmallVector<VarDecl *, 8> Vars;
 
+public:
   AddressTakenAnalysis() {}
 
-public:
   void VisitUnaryAddrOf(const UnaryOperator *E) {
     Expr *Operand = E->getSubExpr();
     DeclRefExpr *DR = dyn_cast<DeclRefExpr>(Operand);
@@ -413,6 +432,7 @@ public:
   }
 
   void analyze(Stmt *Body) {
+    Vars.clear();
     Visit(Body);
     std::sort(Vars.begin(), Vars.end());
     std::unique(Vars.begin(), Vars.end());
@@ -424,64 +444,235 @@ public:
 };
 }
 
-namespace {
-class FindInterestingVars : public StmtVisitor<FindInterestingVars> {
+class InterestingEquivVars : public StmtVisitor<InterestingEquivVars> {
 private:
-  SmallVector<VarDecl *, 8> Vars;
-  AddressTakenAnalysis &AddressTaken;
+  int VarCount = 0;
+  std::map<const VarDecl *,int> VarMap;
+  std::vector<VarDecl *> ReverseMap;
+  AddressTakenAnalysis AddressTaken;
+
 
 public:
-
-  FindInterestingVars(AddressTakenAnalysis &ATA) :AddressTaken(ATA) {
+  InterestingEquivVars() {
   }
 
   void VisitBinaryOperator(const BinaryOperator *BO) {
-  }
-
-  void VisitUnaryAddrOf(const UnaryOperator *E) {
-    Expr *Operand = E->getSubExpr();
-    DeclRefExpr *DR = dyn_cast<DeclRefExpr>(Operand);
-    if (DR) {
-      VarDecl *VD = dyn_cast<VarDecl>(DR->getDecl());
-      if (VD)
-        Vars.push_back(VD);
-      return;
+    if (BO->getOpcode() == BinaryOperatorKind::BO_Assign) {
+      VarDecl *LHSVar = getInterestingVariable(BO->getLHS());
+      VarDecl *RHSVar = getInterestingVariable(BO->getRHS());
+      if (LHSVar && RHSVar) {
+        addVariable(LHSVar);
+        addVariable(RHSVar);
+      }
     }
   }
 
   void analyze(Stmt *Body) {
+    AddressTaken.analyze(Body);
+    VarCount = 0;
+    VarMap.clear();
     Visit(Body);
-    std::sort(Vars.begin(), Vars.end());
-    std::unique(Vars.begin(), Vars.end());
   }
 
-  bool isAddressTaken(VarDecl *VD) {
-    return std::binary_search(Vars.begin(), Vars.end(), VD);
+  int getNumber(const VarDecl *VD) {
+    auto Lookup = VarMap.find(VD);
+    if (Lookup == VarMap.end())
+      return sentinel;
+    else
+      return Lookup->second;
+  }
+
+  VarDecl *getDecl(int i) {
+    if (i >= 0 && (unsigned) i < ReverseMap.size())
+      return ReverseMap[i];
+    return nullptr;
+  }
+
+  static const int sentinel = -1;
+
+private:
+  VarDecl *getInterestingVariable(Expr *E) {
+    VarDecl *D = VarEquiv::getVariable(E);
+    if (D != nullptr && !AddressTaken.isAddressTaken(D))
+      return D;
+    else 
+      return nullptr;
+  }
+
+  void addVariable(VarDecl *D) {
+    auto Lookup = VarMap.find(D);
+
+    if (Lookup == VarMap.end()) {
+      int Position = ReverseMap.size();
+      VarMap[D] = Position;
+      ReverseMap.push_back(D);
+    }
   }
 };
+
+VarEquiv::VarEquiv(CFG *Cfg, Stmt *Body) : Body(Body), Cfg(Cfg) {
+  InterestingVars = new InterestingEquivVars();
+  EquivalentVars = new PartitionRefinement::Partition();
 }
 
-
-VarEquiv::VarEquiv(CFG *cfg /*, Stmt Body */) : cfg(cfg) {
+VarEquiv::~VarEquiv() {
+  delete InterestingVars;
+  delete EquivalentVars;
 }
 
 void VarEquiv::analyze() {
-   // Step 1: compute the set of address-taken variables, because we'll exclude those for now.
-   // Step 2: find the set of interesting variables and number them.
+   // Find the set of interesting variables and number them.
+   InterestingVars->analyze(Body);
+   // For now, do no intraprocedural analysis.  The set of
+   // equivalent variables at the beginning of each basic block should
+   // just be empty.
 }
 
 void VarEquiv::setCurrentBlock(CFGBlock block) {
+  EquivalentVars->clear();
 }
 
-void VarEquiv::moveAfterNextStmt() {
+void VarEquiv::addEffects(Stmt *S) {
+  Expr *E = dyn_cast<Expr>(S);
+  if (E)
+    analyzeExpr(E, EquivalentVars);
+  else
+    llvm_unreachable("expected an expression statement");
 }
 
-void VarEquiv::dumpAll(const SourceManager& M) {
+void VarEquiv::analyzeExpr(Expr *E, PartitionRefinement::Partition *P) {
+  switch (E->getStmtClass()) {
+#define ABSTRACT_STMT(Kind)
+#define STMT(Kind, Base) case Expr::Kind##Class:
+#define EXPR(Kind, Base)
+#include "clang/AST/StmtNodes.inc"
+    llvm_unreachable("cannot analyze a statement in analyzeExpr");
+    case Expr::ConditionalOperatorClass: {
+      ConditionalOperator *CO = dyn_cast<ConditionalOperator>(E);
+      assert(CO && "dyn_cast failed");
+      if (CO)
+        analyzeConditionalOperator(CO, P);
+      return;
+    }
+    case Expr::BinaryConditionalOperatorClass: {
+      BinaryConditionalOperator *BCO =
+        dyn_cast<BinaryConditionalOperator>(E);
+      assert(BCO && "dyn_cast failed");
+      if (BCO)
+        analyzeBinaryConditionalOperator(BCO, P);
+      return;
+    }
+    case Expr::BinaryOperatorClass: {
+      BinaryOperator *BO = dyn_cast<BinaryOperator>(E);
+      assert(BO && "dyn_cast failed");
+      if (BO)
+        analyzeBinaryOperator(BO, P);
+      return;
+    }
+    default:
+      break;
+  }
+
+  // Check children
+  for (auto I = E->child_begin(); I != E->child_end(); ++I) {
+    Expr *Child = dyn_cast<Expr>(*I);
+    assert(Child);
+    if (Child)
+      analyzeExpr(Child, P);
+  }
 }
 
-void VarEquiv::dumpCurrentStmt(const SourceManager& M) {
+void VarEquiv::analyzeConditionalOperator(ConditionalOperator *CO,
+                                          PartitionRefinement::Partition *P) {
+   PartitionRefinement::Partition Tmp;
+   // Compute the variable equivalences that are true after the conditional
+   // expression is evaluated.
+   VarEquiv::analyzeExpr(CO->getCond(), P);
+   // Use those equivalences to compute the equivalences true after evaluating
+   // the LHS and RHS.
+   PartitionRefinement::Partition RHS;
+   RHS.assign(*P);
+   VarEquiv::analyzeExpr(CO->getLHS(), P);
+   VarEquiv::analyzeExpr(CO->getRHS(), &RHS);
+   // Intersect them to determine what is true after the expression.
+   P->refine(&RHS);
 }
 
-const VarDecl *VarEquiv::getRepresentative(const VarDecl *V) {
-  return nullptr;
+void VarEquiv::analyzeBinaryConditionalOperator(BinaryConditionalOperator *BCO,
+                                          PartitionRefinement::Partition *P) {
+  // This is the GNU binary conditional operator e1 ? : e2, which is the same
+  // as e1 ? e1 : e2, except that e1 is executed only once.
+  VarEquiv::analyzeExpr(BCO->getCond(), P);
+  PartitionRefinement::Partition RHS;
+  // Compute the variables equivalences true after evaluating the RHS.
+  RHS.assign(*P);
+  // Intesect the variable equivalences.
+  VarEquiv::analyzeExpr(BCO->getFalseExpr(), &RHS);
+  P->refine(&RHS);
 }
+
+void VarEquiv::analyzeBinaryOperator(BinaryOperator *BO,
+                                     PartitionRefinement::Partition *P) {
+  if (BO->isLogicalOp()) {
+    // Only the first expression is guaranteed to be executed.
+    VarEquiv::analyzeExpr(BO->getLHS(), P);
+    // However, the RHS may evaluated, invalidating some variable
+    // equivalences.  Compute the equivalances true after the RHS.
+    PartitionRefinement::Partition RHSPartition;
+    RHSPartition.assign(*P);
+    VarEquiv::analyzeExpr(BO->getRHS(), &RHSPartition);
+    // Intersect them.
+    P->refine(&RHSPartition);
+    return;
+  }
+
+  VarEquiv::analyzeExpr(BO->getLHS(), P);
+  VarEquiv::analyzeExpr(BO->getRHS(), P);
+
+  if (!BO->isAssignmentOp())
+    return;
+
+  VarDecl *LHS = getVariable(BO->getLHS());
+  if (LHS == nullptr)
+    return;
+
+  int LHSId = InterestingVars->getNumber(LHS);
+  if (LHSId == InterestingEquivVars::sentinel)
+    return;
+
+  EquivalentVars->makeSingleton(LHSId);
+
+  if (BO->getOpcode() != BinaryOperatorKind::BO_Assign)
+    return;
+
+  VarDecl *RHS = getVariable(BO->getRHS());
+  if (RHS == nullptr)
+    return;
+
+  int RHSId = InterestingVars->getNumber(RHS);
+  if (RHSId == InterestingEquivVars::sentinel)
+    return;
+
+  if (LHSId == RHSId) 
+    return;
+
+  EquivalentVars->add(RHSId, LHSId);
+}
+
+const VarDecl *VarEquiv::getRepresentative(const VarDecl *D) {
+  int Id = InterestingVars->getNumber(D);
+  if (Id != InterestingEquivVars::sentinel) {
+    int ResultId = EquivalentVars->getRepresentative(Id);
+    if (ResultId != Id)
+      return InterestingVars->getDecl(ResultId);
+  }
+  return D;
+}
+
+void VarEquiv::dumpAll(raw_ostream &OS, const SourceManager& M) {
+}
+
+void VarEquiv::dumpCurrentStmt(raw_ostream &OS) {
+   EquivalentVars->dump(OS);
+}
+} // namespace Clang
